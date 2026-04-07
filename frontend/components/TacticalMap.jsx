@@ -361,7 +361,7 @@ function segLengthM(i) {
 // Advance a tram along the route using speed × elapsed time since last GPS fix.
 // Returns { lat, lng, seg, routeT } — smoothed display position.
 function deadReckon(tram, nowMs) {
-  if (!tram.updatedAt || tram.status === "STOPPED") {
+  if (!tram.updatedAt || tram.status === "STOPPED" || tram.status === "TERMINAL") {
     return { lat:tram.lat, lng:tram.lng, seg:tram.seg, routeT:tram.routeT };
   }
   const elapsed = Math.min((nowMs - tram.updatedAt) / 1000, 25); // cap at 25s
@@ -441,7 +441,11 @@ export default function CMETv4() {
   const tramStateRef = useRef([]);
   const mapSvgRef    = useRef(null);
   const dragRef      = useRef(null);
-  const fr = useRef(0);
+  const fr           = useRef(0);
+  // Terminal ghost map: id → { tram, terminalSince, timeoutId }
+  // Trams disappear from GTFS-R for 3-5min at terminals during driver change.
+  // Keep them visible (faded) for up to 5 minutes rather than blinking out.
+  const ghostsRef    = useRef(new Map());
   const cx = MW / 2, cy = MH / 2;
 
   // ── Zoom & Pan handlers ──────────────────────────────────────────────────
@@ -540,13 +544,23 @@ export default function CMETv4() {
   }, []);
 
   // Live tram positions — poll backend every 5s, snap to route
+  // Terminal ghost logic: trams disappear from GTFS-R for 3-5min at GGN/ALG
+  // during driver changeover. Keep them visible (faded) for up to 5 minutes.
   useEffect(() => {
     const fetchTrams = async () => {
       try {
         const res  = await fetch(`${API_URL}/api/trams`);
         const data = await res.json();
-        const now    = Date.now();
-        const trams  = data.trams.map(t => {
+        const now     = Date.now();
+        const liveIds = new Set(data.trams.map(t => t.vehicle_label));
+
+        // Build live trams — clear ghost state for any that have reappeared
+        const liveTrams = data.trams.map(t => {
+          if (ghostsRef.current.has(t.vehicle_label)) {
+            const g = ghostsRef.current.get(t.vehicle_label);
+            clearTimeout(g.timeoutId);
+            ghostsRef.current.delete(t.vehicle_label);
+          }
           const snap = snapAndLocate(t.latitude, t.longitude);
           const dir  = t.bearing > 90 && t.bearing < 270 ? "SB" : "NB";
           return {
@@ -568,9 +582,31 @@ export default function CMETv4() {
             del:       null,
           };
         });
-        setTramState(trams);
-        // Seed displayTrams immediately so there's no blank frame before first tick
-        setDisplayTrams(trams);
+
+        // Trams that were active last poll but absent this poll → mark TERMINAL
+        for (const prev of tramStateRef.current) {
+          if (!liveIds.has(prev.id) && prev.status !== "TERMINAL") {
+            const termTram = {
+              ...prev,
+              status:       "TERMINAL",
+              speed:        "0.0",
+              terminalSince: now,
+              // Infer terminal stop from last direction
+              terminalStop: prev.dir === "SB" ? "Alinga Street, City" : "Gungahlin Place",
+            };
+            const timeoutId = setTimeout(() => {
+              ghostsRef.current.delete(prev.id);
+              setTramState(s => s.filter(t => t.id !== prev.id));
+            }, 5 * 60 * 1000);
+            ghostsRef.current.set(prev.id, { tram: termTram, timeoutId });
+          }
+        }
+
+        // Merge live trams + active terminal ghosts
+        const ghosts = Array.from(ghostsRef.current.values()).map(g => g.tram);
+        const merged = [...liveTrams, ...ghosts];
+        setTramState(merged);
+        setDisplayTrams(merged);
       } catch (err) { console.warn("[fetchTrams] fetch failed:", err?.message); }
     };
     fetchTrams();
@@ -839,28 +875,36 @@ export default function CMETv4() {
     for (const t of displayTrams) {
       if (t.seg == null) continue;
       const x  = schematicTramX(t.seg, t.routeT, SCH_PAD, SCH_W);
-      const isSel = sel.t === "tram" && sel.d?.id === t.id;
+      const isSel      = sel.t === "tram" && sel.d?.id === t.id;
+      const isTerminal = t.status === "TERMINAL";
       const triS  = isSel ? 10 : 7;
       const ty2   = t.dir === "SB" ? SCH_Y - 26 : SCH_Y + 26;
       els.push(
-        <g key={"stm"+t.id} onClick={() => setSel({t:"tram",d:t})} style={{cursor:"pointer"}}>
+        <g key={"stm"+t.id} onClick={() => setSel({t:"tram",d:t})}
+          style={{cursor:"pointer", opacity: isTerminal ? 0.30 : 1}}>
           {/* Connector to rail */}
           <line x1={x} y1={t.dir==="SB" ? ty2+triS+2 : ty2-triS-2}
             x2={x} y2={t.dir==="SB" ? SCH_Y-7 : SCH_Y+7}
-            stroke={t.c} strokeWidth={0.6} opacity={0.35} strokeDasharray="2,1"/>
+            stroke={isTerminal?"#ffaa00":t.c} strokeWidth={0.6} opacity={0.35}
+            strokeDasharray={isTerminal?"3,2":"2,1"}/>
           {/* Triangle */}
           <polygon points={triPoints(x, ty2, t.dir, triS)}
-            fill={t.c} stroke={isSel?"#fff":t.c} strokeWidth={isSel?1.5:0.6}
-            style={{filter:`drop-shadow(0 0 4px ${t.c})`}}/>
+            fill={isTerminal?"#ffaa00":t.c}
+            stroke={isSel?"#fff":(isTerminal?"#ffaa00":t.c)}
+            strokeWidth={isSel?1.5:0.6}
+            style={{filter:`drop-shadow(0 0 4px ${isTerminal?"#ffaa00":t.c})`}}/>
           {/* Tram ID label */}
           <text x={x} y={t.dir==="SB" ? ty2-triS-5 : ty2+triS+11}
-            textAnchor="middle" fill={t.c} fontSize={7} fontWeight="bold" fontFamily="monospace">
-            {t.id}
+            textAnchor="middle"
+            fill={isTerminal?"#ffaa00":t.c}
+            fontSize={7} fontWeight="bold" fontFamily="monospace">
+            {t.id}{isTerminal?" ⊡":""}
           </text>
-          {/* Speed label when selected */}
+          {/* Speed / terminal label when selected */}
           {isSel && <text x={x} y={t.dir==="SB" ? ty2-triS-15 : ty2+triS+22}
-            textAnchor="middle" fill={t.c} fontSize={6} opacity={0.65} fontFamily="monospace">
-            {Math.round(t.speed)+"km/h"}
+            textAnchor="middle" fill={isTerminal?"#ffaa00":t.c}
+            fontSize={6} opacity={0.65} fontFamily="monospace">
+            {isTerminal?"TERMINAL":Math.round(t.speed)+"km/h"}
           </text>}
         </g>
       );
@@ -1004,15 +1048,31 @@ export default function CMETv4() {
             {tramState.map(t => (
               <div key={t.id} onClick={()=>setSel({t:"tram",d:t})}
                 style={{padding:"3px 5px",marginBottom:2,cursor:"pointer",
-                  borderLeft:"2px solid "+t.c,
-                  background:sel.d?.id===t.id&&sel.t==="tram"?t.c+"15":"transparent"}}>
-                <div style={{color:t.c,fontWeight:"bold",fontSize:9}}>
-                  {t.id+" "}
-                  <span style={{opacity:0.4,fontWeight:"normal"}}>{t.dir}</span>
-                </div>
-                <div style={{opacity:0.4,fontSize:7}}>
-                  {(t.status==="STOPPED"?">> ":"> ")+t.near+" "+Math.round(t.speed)+"km/h"}
-                </div>
+                  borderLeft:"2px solid "+(t.status==="TERMINAL"?t.c+"55":t.c),
+                  background:sel.d?.id===t.id&&sel.t==="tram"?t.c+"15":"transparent",
+                  opacity:t.status==="TERMINAL"?0.5:1}}>
+                {t.status === "TERMINAL" ? (
+                  <>
+                    <div style={{color:t.c,fontWeight:"bold",fontSize:9}}>
+                      {t.id+" "}
+                      <span style={{color:"#ffaa00",fontWeight:"normal",fontSize:7,
+                        letterSpacing:1}}>TERMINAL</span>
+                    </div>
+                    <div style={{opacity:0.35,fontSize:7}}>
+                      {">> AT "+(t.dir==="SB"?"ALG":"GGN")+" · TURNAROUND"}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{color:t.c,fontWeight:"bold",fontSize:9}}>
+                      {t.id+" "}
+                      <span style={{opacity:0.4,fontWeight:"normal"}}>{t.dir}</span>
+                    </div>
+                    <div style={{opacity:0.4,fontSize:7}}>
+                      {(t.status==="STOPPED"?">> ":"> ")+t.near+" "+Math.round(t.speed)+"km/h"}
+                    </div>
+                  </>
+                )}
               </div>
             ))}
           </>}
@@ -1346,20 +1406,23 @@ export default function CMETv4() {
             {/* Trams — direction triangles with callout labels */}
             {ly.trams && displayTrams.map(t => {
               const p = toXY(t.lat, t.lng);
-              const isSel = sel.t==="tram" && D?.id===t.id;
+              const isSel     = sel.t==="tram" && D?.id===t.id;
+              const isTerminal = t.status === "TERMINAL";
               const triS  = isSel ? 8 : 6;
               const arrow = t.dir === "SB" ? "▼" : "▲";
-              const labelW = isSel ? 54 : 46;
+              const labelW = isSel ? 60 : 50;
               const labelH = isSel ? 24 : 20;
-              // Pill sits above the triangle; connector line bridges the gap
               const pillX = p.x - labelW / 2;
               const pillY = p.y - triS - 6 - labelH;
               return (
-                <g key={"tm"+t.id} onClick={()=>setSel({t:"tram",d:t})} style={{cursor:"pointer"}}>
-                  {/* glow halo */}
+                <g key={"tm"+t.id} onClick={()=>setSel({t:"tram",d:t})}
+                  style={{cursor:"pointer", opacity: isTerminal ? 0.30 : 1}}>
+                  {/* glow halo — slower pulse for terminal */}
                   <circle cx={p.x} cy={p.y} r={isSel?18:10} fill={t.c} opacity={0.05}>
-                    <animate attributeName="r" values={isSel?"14;20;14":"8;12;8"}
-                      dur="1.5s" repeatCount="indefinite"/>
+                    <animate attributeName="r"
+                      values={isSel?"14;20;14":"8;12;8"}
+                      dur={isTerminal?"3s":"1.5s"}
+                      repeatCount="indefinite"/>
                   </circle>
                   {/* direction triangle */}
                   <polygon
@@ -1369,25 +1432,27 @@ export default function CMETv4() {
                     strokeWidth={isSel?1.5:0.6}
                     style={{filter:`drop-shadow(0 0 3px ${t.c})`}}
                   />
-                  {/* callout connector: pill bottom → triangle top */}
+                  {/* callout connector */}
                   <line x1={p.x} y1={pillY+labelH} x2={p.x} y2={p.y-triS}
                     stroke={t.c} strokeWidth={0.5} opacity={isSel?0.5:0.3}
-                    strokeDasharray={isSel?"none":"2,1"}/>
-                  {/* label pill background */}
+                    strokeDasharray={isTerminal?"3,2":isSel?"none":"2,1"}/>
+                  {/* label pill */}
                   <rect x={pillX} y={pillY} width={labelW} height={labelH}
                     fill="#000a04" fillOpacity={0.90}
-                    stroke={t.c} strokeWidth={isSel?1:0.5} rx={2}/>
-                  {/* ID + direction arrow — primary */}
+                    stroke={isTerminal?"#ffaa00":t.c}
+                    strokeWidth={isSel?1:0.5} rx={2}
+                    strokeDasharray={isTerminal?"3,2":"none"}/>
+                  {/* ID — primary */}
                   <text x={p.x} y={pillY+(isSel?10:9)} textAnchor="middle"
-                    fill={t.c} fontSize={isSel?7.5:7} fontWeight="bold"
+                    fill={isTerminal?"#ffaa00":t.c} fontSize={isSel?7.5:7} fontWeight="bold"
                     fontFamily="monospace" letterSpacing={0.5}>
-                    {t.id+" "+arrow}
+                    {t.id+" "+(isTerminal?"⊡":arrow)}
                   </text>
-                  {/* speed + status — secondary */}
+                  {/* secondary line */}
                   <text x={p.x} y={pillY+(isSel?19:16)} textAnchor="middle"
-                    fill={t.c} fontSize={isSel?6:5.5} opacity={0.55}
+                    fill={isTerminal?"#ffaa00":t.c} fontSize={isSel?6:5.5} opacity={0.55}
                     fontFamily="monospace">
-                    {t.speed+"km/h · "+(t.status==="STOPPED"?"STP":"MVG")}
+                    {isTerminal?"TERMINAL":t.speed+"km/h · "+(t.status==="STOPPED"?"STP":"MVG")}
                   </text>
                 </g>
               );
@@ -1542,11 +1607,13 @@ export default function CMETv4() {
                     {/* LRV photo */}
                     {LRV_IMAGES[D.id] ? (
                       <div style={{marginBottom:8,borderRadius:2,overflow:"hidden",
-                        border:"1px solid "+D.c+"40",boxShadow:"0 0 8px "+D.c+"20"}}>
+                        border:"1px solid "+(D.status==="TERMINAL"?"#ffaa0055":D.c+"40"),
+                        boxShadow:"0 0 8px "+D.c+"20",
+                        opacity:D.status==="TERMINAL"?0.65:1}}>
                         <img src={LRV_IMAGES[D.id]} alt={D.id}
                           style={{width:"100%",display:"block",objectFit:"cover",maxHeight:110}}/>
                         <div style={{background:"#000a",padding:"2px 5px",fontSize:6,
-                          letterSpacing:2,color:D.c,opacity:0.7}}>
+                          letterSpacing:2,color:D.status==="TERMINAL"?"#ffaa00":D.c,opacity:0.7}}>
                           {D.id} // CMET FLEET
                         </div>
                       </div>
@@ -1559,26 +1626,53 @@ export default function CMETv4() {
                         <span style={{fontSize:6,opacity:0.12,letterSpacing:2}}>// CLASSIFIED</span>
                       </div>
                     )}
-                    <div style={{fontSize:14,fontWeight:"bold",color:D.c,marginBottom:5}}>{D.id}</div>
-                    <InfoRow label="STATUS"  value={D.status}/>
-                    <InfoRow label="SPEED"   value={Math.round(D.speed)+" km/h"}/>
-                    <InfoRow label="DIR"     value={D.dir==="SB"?"SOUTHBOUND":"NORTHBOUND"}/>
-                    <InfoRow label="BEARING" value={Math.round(D.bearing)+"°"}/>
-                    <InfoRow label="NEAR"    value={"Stop "+D.near}/>
-                    <InfoRow label="POS"     value={D.rawLat?.toFixed(4)+"S "+D.rawLng?.toFixed(4)+"E"}/>
+                    <div style={{fontSize:14,fontWeight:"bold",
+                      color:D.status==="TERMINAL"?"#ffaa00":D.c,marginBottom:5}}>{D.id}</div>
 
-                    {D.seg!=null && <>
-                      <div style={{marginTop:8,letterSpacing:2,fontSize:7,opacity:0.3,marginBottom:3}}>
-                        NEXT STOPS
-                      </div>
-                      {calcUpcomingStops(D.seg, D.routeT, D.dir).slice(0,6).map(({stop,etaSec}) => (
-                        <div key={stop.id} style={{display:"flex",justifyContent:"space-between",
-                          padding:"2px 0",borderBottom:"1px solid "+th.a+"08"}}>
-                          <span style={{opacity:stop.ix?1:0.6,fontSize:7}}>{stop.name}</span>
-                          <span style={{color:etaSec<120?"#ffaa00":th.a,fontSize:7}}>{fmtEta(etaSec)}</span>
+                    {D.status === "TERMINAL" ? (
+                      /* ── TERMINAL STATE ── */
+                      <>
+                        <InfoRow label="STATUS"    value="TERMINAL"   color="#ffaa00"/>
+                        <InfoRow label="LAST DIR"  value={D.dir==="SB"?"SOUTHBOUND":"NORTHBOUND"}/>
+                        <InfoRow label="LAST STOP" value={D.terminalStop || (D.dir==="SB"?"Alinga St":"Gungahlin Place")}/>
+                        <InfoRow label="TURNAROUND"
+                          value={"~"+fmtEta(Math.round((Date.now()-D.terminalSince)/1000))+" ago"}
+                          color="#ffaa00"/>
+                        <div style={{marginTop:10,padding:"6px 8px",
+                          background:"#ffaa0008",border:"1px solid #ffaa0025",
+                          borderRadius:2,fontSize:7,lineHeight:1.7,letterSpacing:0.5}}>
+                          <div style={{color:"#ffaa00",opacity:0.7,marginBottom:3,letterSpacing:2}}>
+                            AWAITING DEPARTURE
+                          </div>
+                          Expected {D.dir==="SB"?"northbound":"southbound"} service.
+                          Driver changeover in progress at terminal.
+                          Vehicle will reappear on next trip assignment.
                         </div>
-                      ))}
-                    </>}
+                      </>
+                    ) : (
+                      /* ── ACTIVE STATE ── */
+                      <>
+                        <InfoRow label="STATUS"  value={D.status}/>
+                        <InfoRow label="SPEED"   value={Math.round(D.speed)+" km/h"}/>
+                        <InfoRow label="DIR"     value={D.dir==="SB"?"SOUTHBOUND":"NORTHBOUND"}/>
+                        <InfoRow label="BEARING" value={Math.round(D.bearing)+"°"}/>
+                        <InfoRow label="NEAR"    value={"Stop "+D.near}/>
+                        <InfoRow label="POS"     value={D.rawLat?.toFixed(4)+"S "+D.rawLng?.toFixed(4)+"E"}/>
+
+                        {D.seg!=null && <>
+                          <div style={{marginTop:8,letterSpacing:2,fontSize:7,opacity:0.3,marginBottom:3}}>
+                            NEXT STOPS
+                          </div>
+                          {calcUpcomingStops(D.seg, D.routeT, D.dir).slice(0,6).map(({stop,etaSec}) => (
+                            <div key={stop.id} style={{display:"flex",justifyContent:"space-between",
+                              padding:"2px 0",borderBottom:"1px solid "+th.a+"08"}}>
+                              <span style={{opacity:stop.ix?1:0.6,fontSize:7}}>{stop.name}</span>
+                              <span style={{color:etaSec<120?"#ffaa00":th.a,fontSize:7}}>{fmtEta(etaSec)}</span>
+                            </div>
+                          ))}
+                        </>}
+                      </>
+                    )}
                   </div>
                 )}
 
