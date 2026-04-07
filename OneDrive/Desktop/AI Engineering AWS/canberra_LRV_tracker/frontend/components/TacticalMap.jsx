@@ -85,6 +85,26 @@ const SB_RUNTIMES = [124, 110, 96, 112, 125, 117, 136, 129, 110, 120, 90, 109, 1
 const NB_RUNTIMES = [118, 119, 96, 129, 120, 128, 135, 124, 117, 114, 76, 85, 114];
 const DWELL = 20; // seconds dwell at each stop
 
+// ─── SCHEMATIC CONSTANTS (T-Vis ops data) ────────────────────────────────────
+// Stop-to-stop distances in metres — GGN→MCK, MCK→MPN … ELA→ALG
+const SCHEMATIC_DISTS = [707, 1219, 785, 977, 1430, 798, 896, 1339, 650, 1072, 644, 772, 553];
+// Cumulative metres from GGN to each stop; 14 entries (SCHEMATIC_CUM[0]=0)
+const SCHEMATIC_CUM = SCHEMATIC_DISTS.reduce((acc, d) => [...acc, acc[acc.length - 1] + d], [0]);
+
+// ─── SPEED LIMIT PROFILE (T-Vis ops data — unique, no public source) ─────────
+// [distanceFromGGN_m, limitKmh] — step function, left-inclusive
+const SPEED_LIMIT_PROFILE = [
+  [0,15],[22,15],[80,20],[315,50],[360,70],[707,30],[747,50],[795,70],
+  [1162,50],[1235,40],[1300,50],[1350,70],[1926,30],[1968,50],[2040,70],
+  [2711,30],[2760,50],[2830,70],[3688,30],[3728,50],[3800,70],[5118,30],
+  [5152,50],[5210,25],[5916,30],[5950,50],[6559,20],[6812,30],[6845,50],
+  [6855,50],[8152,30],[8192,50],[8300,70],[8801,30],[8835,50],
+];
+
+// Satellite tile constants (ESRI World Imagery, Slippy Map)
+const SAT_ZOOM    = 14;
+const SAT_TILE_PX = 256;
+
 const CAMS = [
   {id:"C01",n:"Gungahlin TC",    lat:-35.1847,lng:149.1332,s:"ON"},
   {id:"C02",n:"Mapleton Xing",   lat:-35.1928,lng:149.1385,s:"ON"},
@@ -265,6 +285,63 @@ function nextArrivalsAt(stopId, trams) {
   return { sb: sb[0]||null, nb: nb[0]||null };
 }
 
+// ─── SCHEMATIC / SPEED PROFILE / SATELLITE HELPERS ───────────────────────────
+function schematicX(stopIdx, pad = 40) {
+  const total = SCHEMATIC_CUM[SCHEMATIC_CUM.length - 1];
+  return pad + (SCHEMATIC_CUM[stopIdx] / total) * (MW - 2 * pad);
+}
+function schematicTramX(seg, routeT, pad = 40) {
+  return schematicX(seg, pad) + routeT * (schematicX(seg + 1, pad) - schematicX(seg, pad));
+}
+function tramDistFromGGN(seg, routeT) {
+  return SCHEMATIC_CUM[seg] + routeT * SCHEMATIC_DISTS[seg];
+}
+function speedLimitAt(distM) {
+  let limit = SPEED_LIMIT_PROFILE[0][1];
+  for (const [d, spd] of SPEED_LIMIT_PROFILE) {
+    if (distM >= d) limit = spd; else break;
+  }
+  return limit;
+}
+function calcSegmentHeadway(segIdx, dir, trams) {
+  const stopId = STOPS[dir === "SB" ? segIdx + 1 : segIdx].id;
+  const arrivals = [];
+  for (const t of trams) {
+    if (t.dir !== dir || t.seg == null) continue;
+    const hit = calcUpcomingStops(t.seg, t.routeT, t.dir).find(u => u.stop.id === stopId);
+    if (hit) arrivals.push(hit.etaSec);
+  }
+  arrivals.sort((a, b) => a - b);
+  return arrivals.length < 2 ? null : arrivals[1] - arrivals[0];
+}
+function segmentColor(segIdx, trams) {
+  let minHw = Infinity;
+  for (const dir of ["SB","NB"]) {
+    const hw = calcSegmentHeadway(segIdx, dir, trams);
+    if (hw !== null && hw < minHw) minHw = hw;
+  }
+  if (minHw === Infinity) return "#00ff88";
+  if (minHw < 180)  return "#ffaa00";
+  if (minHw > 720)  return "#ff3333";
+  return "#00ff88";
+}
+function latLngToGlobalPx(lat, lng, zoom) {
+  const n = Math.pow(2, zoom);
+  const latRad = lat * Math.PI / 180;
+  return {
+    px: (lng + 180) / 360 * n * SAT_TILE_PX,
+    py: (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n * SAT_TILE_PX,
+  };
+}
+function latLngToTileXY(lat, lng, zoom) {
+  const n = Math.pow(2, zoom);
+  const latRad = lat * Math.PI / 180;
+  return {
+    tileX: Math.floor((lng + 180) / 360 * n),
+    tileY: Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n),
+  };
+}
+
 // ─── TRIANGLE MARKER ──────────────────────────────────────────────────────────
 function triPoints(px, py, dir, s=7) {
   return dir === "SB"
@@ -346,7 +423,9 @@ export default function CMETv4() {
   const [ly,        setLy]        = useState({
     route:true, stops:true, trams:true, cam:true,
     faults:true, events:true, esa:true, bus:false, lm:true,
+    speedProfile:false, sat:false,
   });
+  const [schematicMode, setSchematicMode] = useState(false);
   const [vm,      setVm]      = useState("SAT");
   const [logs,    setLogs]    = useState([]);
   const [tab,     setTab]     = useState("intel");
@@ -584,6 +663,19 @@ export default function CMETv4() {
     return () => clearInterval(iv);
   }, []);
 
+  // Keyboard shortcuts — "S" toggles schematic mode
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+      if (e.key === "s" || e.key === "S") {
+        setSchematicMode(prev => !prev);
+        setView({ x:0, y:0, z:1 });
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, []);
+
   // Route line uses dense waypoints so the SVG path follows the road curves
   const routePts = ROUTE_WPT.map(w => toXY(w[0], w[1]));
   const routeD   = routePts.map((p,i) => (i===0?"M":"L")+p.x+","+p.y).join(" ");
@@ -609,6 +701,138 @@ export default function CMETv4() {
     NV:"brightness(1.3) saturate(0.2) sepia(0.5) hue-rotate(70deg)",
     FLIR:"brightness(1.1) contrast(1.4) saturate(0) invert(1) hue-rotate(180deg)",
     CRT:"brightness(0.85) contrast(1.2)",
+  };
+
+  // ── Satellite tile coordinates (computed per render when sat layer active) ──
+  const satTiles = (() => {
+    if (!ly.sat) return null;
+    const originGpx = latLngToGlobalPx(BOUNDS.maxLat, BOUNDS.minLng, SAT_ZOOM);
+    const bottomGpx = latLngToGlobalPx(BOUNDS.minLat, BOUNDS.minLng, SAT_ZOOM);
+    const rightGpx  = latLngToGlobalPx(BOUNDS.maxLat, BOUNDS.maxLng, SAT_ZOOM);
+    const scaleX = (MW - 2*MP) / (rightGpx.px  - originGpx.px);
+    const scaleY = (MH - 2*MP) / (bottomGpx.py - originGpx.py);
+    const tlTile = latLngToTileXY(BOUNDS.maxLat, BOUNDS.minLng, SAT_ZOOM);
+    const brTile = latLngToTileXY(BOUNDS.minLat, BOUNDS.maxLng, SAT_ZOOM);
+    const tiles = [];
+    for (let tx = tlTile.tileX; tx <= brTile.tileX; tx++) {
+      for (let ty = tlTile.tileY; ty <= brTile.tileY; ty++) {
+        tiles.push({
+          tx, ty,
+          x: MP + (tx * SAT_TILE_PX - originGpx.px) * scaleX,
+          y: MP + (ty * SAT_TILE_PX - originGpx.py) * scaleY,
+          w: SAT_TILE_PX * scaleX,
+          h: SAT_TILE_PX * scaleY,
+        });
+      }
+    }
+    return tiles;
+  })();
+
+  // ── Linear schematic view ─────────────────────────────────────────────────
+  const renderSchematic = () => {
+    const SCH_Y = 340;
+    const stopXs = STOPS.map((_, i) => schematicX(i));
+    const els = [];
+
+    // Title & hint
+    els.push(
+      <text key="sch-title" x={MW/2} y={24} textAnchor="middle"
+        fill={th.a} fontSize={9} letterSpacing={4} opacity={0.55} fontFamily="monospace">
+        SCHEMATIC VIEW — GGN → ALG
+      </text>,
+      <text key="sch-hint" x={MW-10} y={24} textAnchor="end"
+        fill={th.a} fontSize={7} opacity={0.25} fontFamily="monospace">
+        [S] GEO
+      </text>
+    );
+
+    // Segment coloured lines + annotations
+    for (let i = 0; i < STOPS.length - 1; i++) {
+      const color = segmentColor(i, displayTrams);
+      const mx = (stopXs[i] + stopXs[i+1]) / 2;
+      els.push(
+        <line key={"sl"+i} x1={stopXs[i]} y1={SCH_Y} x2={stopXs[i+1]} y2={SCH_Y}
+          stroke={color} strokeWidth={3} opacity={0.75}/>,
+        <text key={"sd"+i} x={mx} y={SCH_Y+14} textAnchor="middle"
+          fill={th.a} fontSize={5.5} opacity={0.30} fontFamily="monospace">
+          {SCHEMATIC_DISTS[i]+"m"}
+        </text>,
+        <text key={"sr"+i} x={mx} y={SCH_Y+22} textAnchor="middle"
+          fill={th.a} fontSize={5} opacity={0.20} fontFamily="monospace">
+          {SB_RUNTIMES[i]+"↓ "+NB_RUNTIMES[i]+"↑s"}
+        </text>
+      );
+    }
+
+    // Stop nodes, codes, ETA labels
+    for (let i = 0; i < STOPS.length; i++) {
+      const s = STOPS[i];
+      const x = stopXs[i];
+      const isSel = sel.t === "stop" && sel.d?.id === s.id;
+      const onClick = () => setSel({t:"stop",d:s});
+      els.push(
+        s.ix
+          ? <rect key={"sn"+i} x={x-6} y={SCH_Y-6} width={12} height={12}
+              fill={isSel?th.a+"44":"#00000099"} stroke={th.a}
+              strokeWidth={isSel?2:1.5} rx={1}
+              onClick={onClick} style={{cursor:"pointer"}}/>
+          : <circle key={"sn"+i} cx={x} cy={SCH_Y} r={isSel?5:4}
+              fill={isSel?th.a:"#000"} stroke={th.a} strokeWidth={1.2} opacity={0.7}
+              onClick={onClick} style={{cursor:"pointer"}}/>,
+        <text key={"sc"+i} x={x} y={SCH_Y-13} textAnchor="middle"
+          fill={th.a} fontSize={s.ix?7:6} fontWeight={s.ix?"bold":"normal"}
+          opacity={s.ix?0.9:0.6} fontFamily="monospace"
+          onClick={onClick} style={{cursor:"pointer"}}>
+          {s.code}
+        </text>
+      );
+      const { sb: sbA, nb: nbA } = nextArrivalsAt(s.id, displayTrams);
+      if (sbA) els.push(
+        <text key={"eb"+i} x={x} y={SCH_Y+34} textAnchor="middle"
+          fill={sbA.tram.c} fontSize={5.5} fontFamily="monospace">
+          {"↓"+fmtEta(sbA.etaSec)}
+        </text>
+      );
+      if (nbA) els.push(
+        <text key={"en"+i} x={x} y={SCH_Y+43} textAnchor="middle"
+          fill={nbA.tram.c} fontSize={5.5} fontFamily="monospace">
+          {"↑"+fmtEta(nbA.etaSec)}
+        </text>
+      );
+    }
+
+    // Tram triangles — SB above line, NB below
+    for (const t of displayTrams) {
+      if (t.seg == null) continue;
+      const x = schematicTramX(t.seg, t.routeT);
+      const isSel = sel.t === "tram" && sel.d?.id === t.id;
+      const triS = isSel ? 8 : 6;
+      const ty2 = t.dir === "SB" ? SCH_Y - 20 : SCH_Y + 20;
+      els.push(
+        <g key={"stm"+t.id} onClick={() => setSel({t:"tram",d:t})} style={{cursor:"pointer"}}>
+          <line x1={x} y1={t.dir==="SB" ? ty2+triS+1 : ty2-triS-1}
+            x2={x} y2={t.dir==="SB" ? SCH_Y-6 : SCH_Y+6}
+            stroke={t.c} strokeWidth={0.5} opacity={0.3} strokeDasharray="2,1"/>
+          <polygon points={triPoints(x, ty2, t.dir, triS)}
+            fill={t.c} stroke={isSel?"#fff":t.c} strokeWidth={isSel?1.5:0.6}
+            style={{filter:`drop-shadow(0 0 3px ${t.c})`}}/>
+          <text x={x} y={t.dir==="SB" ? ty2-triS-4 : ty2+triS+10}
+            textAnchor="middle" fill={t.c} fontSize={6} fontWeight="bold" fontFamily="monospace">
+            {t.id}
+          </text>
+        </g>
+      );
+    }
+
+    // Legend
+    els.push(
+      <text key="sch-leg" x={10} y={MH-14} fill={th.a} fontSize={5.5}
+        opacity={0.22} fontFamily="monospace">
+        {"● GREEN=NOMINAL  ● AMBER=BUNCHING <3min  ● RED=GAP >12min"}
+      </text>
+    );
+
+    return <g>{els}</g>;
   };
 
   const InfoRow = ({label, value, color}) => (
@@ -668,10 +892,11 @@ export default function CMETv4() {
         <div style={{width:170,borderRight:"1px solid "+th.a+"15",background:th.bg,
           overflowY:"auto",fontSize:8,padding:8}}>
 
-          <div style={{letterSpacing:3,marginBottom:4,opacity:0.3,fontSize:7}}>{"LAYERS ("+lc+"/9)"}</div>
+          <div style={{letterSpacing:3,marginBottom:4,opacity:0.3,fontSize:7}}>{"LAYERS ("+lc+"/"+Object.keys(ly).length+")"}</div>
           {[["route","LR CORRIDOR"],["stops","STOPS (14)"],["trams","LRV FLEET"],["cam","CAMERAS"],
             ["faults","SL FAULTS"],["events","ROAD EVENTS"],["esa","ESA INCIDENTS"],
-            ["bus","RAPID ROUTES"],["lm","LANDMARKS"]].map(([k,l]) => {
+            ["bus","RAPID ROUTES"],["lm","LANDMARKS"],
+            ["speedProfile","SPEED PROFILE"],["sat","SAT IMAGERY"]].map(([k,l]) => {
             const layerColor = k==="esa"?"#ff2222":k==="faults"?"#ff8800":k==="bus"?"#ff4444":th.a;
             return (
               <div key={k} onClick={()=>setLy(prev=>({...prev,[k]:!prev[k]}))}
@@ -697,6 +922,16 @@ export default function CMETv4() {
               </div>
             );
           })}
+          <div style={{marginTop:6,borderTop:"1px solid "+th.a+"12",paddingTop:6}}>
+            <div onClick={()=>{ setSchematicMode(p=>!p); setView({x:0,y:0,z:1}); }}
+              style={{padding:"3px 5px",cursor:"pointer",
+                background:schematicMode?th.a+"15":"transparent",
+                fontWeight:schematicMode?"bold":"normal",
+                borderLeft:schematicMode?"2px solid "+th.a:"2px solid transparent",
+                letterSpacing:1}}>
+              SCHEMATIC [S]
+            </div>
+          </div>
 
           {/* FLEET | STOPS tab bar */}
           <div style={{display:"flex",borderBottom:"1px solid "+th.a+"15",marginTop:10,marginBottom:4}}>
@@ -769,8 +1004,9 @@ export default function CMETv4() {
         <div style={{flex:1,position:"relative",display:"flex",justifyContent:"center",
           alignItems:"center",overflow:"hidden",background:th.terr}}>
 
-          {/* Terrain texture + grid + roads */}
-          <svg width="100%" height="100%" style={{position:"absolute",inset:0}}>
+          {/* Terrain texture + grid + roads — hidden when sat imagery is active */}
+          <svg width="100%" height="100%"
+            style={{position:"absolute",inset:0,opacity:ly.sat?0:1,transition:"opacity 0.3s"}}>
             {Array.from({length:120},(_,i) => {
               const x=noise(i*7.3)*MW, y2=noise(i*13.1)*MH;
               const w=6+noise(i*3.7)*25, h=4+noise(i*5.1)*18;
@@ -841,8 +1077,22 @@ export default function CMETv4() {
             onDoubleClick={resetView}
           >
 
-            {/* Suburb zone labels — below route */}
-            {ZONES.map((z,i) => {
+            {/* SCHEMATIC MODE — replaces all geographic layers */}
+            {schematicMode ? renderSchematic() : (<>
+
+            {/* Satellite imagery tiles — rendered first so all layers sit above */}
+            {ly.sat && satTiles && (
+              <g>
+                {satTiles.map(({ tx, ty, x, y, w, h }) => (
+                  <image key={`sat-${tx}-${ty}`}
+                    href={`https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${SAT_ZOOM}/${ty}/${tx}`}
+                    x={x} y={y} width={w} height={h} preserveAspectRatio="none"/>
+                ))}
+              </g>
+            )}
+
+            {/* Suburb zone labels — hidden in sat mode */}
+            {!ly.sat && ZONES.map((z,i) => {
               const p = toXY(z.lat, z.lng);
               return (
                 <text key={"zn"+i} x={p.x} y={p.y} fill={th.a} opacity={0.10}
@@ -868,11 +1118,13 @@ export default function CMETv4() {
               );
             })}
 
-            {/* LR Route */}
+            {/* LR Route — reduced opacity when sat imagery is behind it */}
             {ly.route && (
               <g>
-                <path d={routeD} fill="none" stroke={th.a} strokeWidth={1} opacity={0.1}/>
-                <path d={routeD} fill="none" stroke={th.a} strokeWidth={2.5} opacity={0.3}
+                <path d={routeD} fill="none" stroke={th.a} strokeWidth={1}
+                  opacity={ly.sat?0.04:0.1}/>
+                <path d={routeD} fill="none" stroke={th.a} strokeWidth={2.5}
+                  opacity={ly.sat?0.15:0.3}
                   strokeDasharray="6,4" strokeLinecap="round">
                   <animate attributeName="stroke-dashoffset" from="0" to="-20"
                     dur="1.5s" repeatCount="indefinite"/>
@@ -1077,6 +1329,9 @@ export default function CMETv4() {
                 </g>
               );
             })}
+
+            {/* End of geographic layers — schematic conditional */}
+            </>)}
           </svg>
 
           {/* HUD overlays */}
@@ -1117,6 +1372,81 @@ export default function CMETv4() {
                 display:"flex",alignItems:"center",justifyContent:"center",cursor:"pointer",
                 fontSize:14,opacity:0.4,background:th.bg,userSelect:"none",lineHeight:1}}>+</div>
           </div>
+
+          {/* ── SPEED PROFILE PANEL ── */}
+          {ly.speedProfile && (() => {
+            const PW = 460, PH = 120;
+            const LPAD = 28, RPAD = 6, TPAD = 14, BPAD = 18;
+            const CW = PW - LPAD - RPAD, CH = PH - TPAD - BPAD;
+            const MAX_DIST = SCHEMATIC_CUM[SCHEMATIC_CUM.length - 1];
+            const MAX_SPD  = 80;
+            const xOf = d   => LPAD + (d / MAX_DIST) * CW;
+            const yOf = spd => TPAD + CH - (spd / MAX_SPD) * CH;
+
+            // Speed limit step-function polyline
+            const spdPts = [];
+            for (let i = 0; i < SPEED_LIMIT_PROFILE.length; i++) {
+              const [d, spd] = SPEED_LIMIT_PROFILE[i];
+              const nextD = i+1 < SPEED_LIMIT_PROFILE.length ? SPEED_LIMIT_PROFILE[i+1][0] : MAX_DIST;
+              spdPts.push(`${xOf(d).toFixed(1)},${yOf(spd).toFixed(1)}`);
+              spdPts.push(`${xOf(nextD).toFixed(1)},${yOf(spd).toFixed(1)}`);
+            }
+
+            return (
+              <div style={{position:"absolute",bottom:46,left:0,right:0,height:PH,
+                background:"rgba(0,5,2,0.93)",borderTop:"1px solid "+th.a+"22",
+                zIndex:11,overflow:"hidden"}}>
+                <svg width="100%" height="100%" viewBox={`0 0 ${PW} ${PH}`} preserveAspectRatio="none">
+                  {/* Title */}
+                  <text x={LPAD} y={10} fill={th.a} fontSize={6} letterSpacing={2}
+                    opacity={0.35} fontFamily="monospace">SPEED PROFILE km/h</text>
+
+                  {/* Grid lines + Y-axis labels */}
+                  {[0,20,40,60,80].map(spd => (
+                    <g key={"yg"+spd}>
+                      <line x1={LPAD} y1={yOf(spd)} x2={LPAD+CW} y2={yOf(spd)}
+                        stroke={th.a} strokeWidth={0.3} opacity={0.08}/>
+                      <text x={LPAD-3} y={yOf(spd)+3} textAnchor="end"
+                        fill={th.a} fontSize={5} opacity={0.25} fontFamily="monospace">{spd}</text>
+                    </g>
+                  ))}
+
+                  {/* Stop tick marks on X-axis */}
+                  {STOPS.map((s, i) => (
+                    <g key={"xtk"+i}>
+                      <line x1={xOf(SCHEMATIC_CUM[i])} y1={TPAD+CH}
+                        x2={xOf(SCHEMATIC_CUM[i])} y2={TPAD+CH+3}
+                        stroke={th.a} strokeWidth={s.ix?1:0.5} opacity={s.ix?0.4:0.18}/>
+                      {s.ix && <text x={xOf(SCHEMATIC_CUM[i])} y={TPAD+CH+9}
+                        textAnchor="middle" fill={th.a} fontSize={4.5} opacity={0.3}
+                        fontFamily="monospace">{s.code}</text>}
+                    </g>
+                  ))}
+
+                  {/* Speed limit step-function */}
+                  <polyline points={spdPts.join(" ")}
+                    fill="none" stroke="#666" strokeWidth={1}
+                    strokeDasharray="4,3" opacity={0.65}/>
+
+                  {/* Tram dots */}
+                  {displayTrams.filter(t => t.seg != null).map(t => {
+                    const dist  = tramDistFromGGN(t.seg, t.routeT);
+                    const spd   = parseFloat(t.speed);
+                    const limit = speedLimitAt(dist);
+                    const dotC  = spd <= limit ? "#00ff88" : spd <= limit+5 ? "#ffaa00" : "#ff3333";
+                    return (
+                      <g key={"sp"+t.id}>
+                        <circle cx={xOf(dist)} cy={yOf(spd)} r={4} fill={dotC}
+                          style={{filter:`drop-shadow(0 0 3px ${dotC})`}}/>
+                        <text x={xOf(dist)+5} y={yOf(spd)+3} fill={dotC}
+                          fontSize={5} fontFamily="monospace">{t.id}</text>
+                      </g>
+                    );
+                  })}
+                </svg>
+              </div>
+            );
+          })()}
         </div>
 
         {/* ── RIGHT PANEL ── */}
@@ -1381,7 +1711,7 @@ export default function CMETv4() {
         background:th.bg,fontSize:7,opacity:0.4,zIndex:20}}>
         <span>OPS CENTRE MAWSON ACT</span>
         <span>GTFS-R | SODA | ESA | ACTmapi | Waze | BuiltForCBR</span>
-        <span>{vm+" | "+lc+"/9"}</span>
+        <span>{(schematicMode?"SCH":"GEO")+" | "+vm+" | "+lc+"/"+Object.keys(ly).length}</span>
       </div>
 
       <style>{
