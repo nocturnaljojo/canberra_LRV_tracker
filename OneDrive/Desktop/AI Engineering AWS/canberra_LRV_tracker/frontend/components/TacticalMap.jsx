@@ -286,12 +286,12 @@ function nextArrivalsAt(stopId, trams) {
 }
 
 // ─── SCHEMATIC / SPEED PROFILE / SATELLITE HELPERS ───────────────────────────
-function schematicX(stopIdx, pad = 40) {
+function schematicX(stopIdx, pad = 40, width = MW) {
   const total = SCHEMATIC_CUM[SCHEMATIC_CUM.length - 1];
-  return pad + (SCHEMATIC_CUM[stopIdx] / total) * (MW - 2 * pad);
+  return pad + (SCHEMATIC_CUM[stopIdx] / total) * (width - 2 * pad);
 }
-function schematicTramX(seg, routeT, pad = 40) {
-  return schematicX(seg, pad) + routeT * (schematicX(seg + 1, pad) - schematicX(seg, pad));
+function schematicTramX(seg, routeT, pad = 40, width = MW) {
+  return schematicX(seg, pad, width) + routeT * (schematicX(seg+1, pad, width) - schematicX(seg, pad, width));
 }
 function tramDistFromGGN(seg, routeT) {
   return SCHEMATIC_CUM[seg] + routeT * SCHEMATIC_DISTS[seg];
@@ -730,103 +730,157 @@ export default function CMETv4() {
 
   // ── Linear schematic view ─────────────────────────────────────────────────
   const renderSchematic = () => {
-    const SCH_Y = 340;
-    const stopXs = STOPS.map((_, i) => schematicX(i));
+    // Uses a 1000×400 viewBox — wider than the fixed 460px canvas, giving room for labels
+    const SCH_W = 1000, SCH_H = 400, SCH_Y = 200;
+    const SCH_PAD = 44;
+    const stopXs = STOPS.map((_, i) => schematicX(i, SCH_PAD, SCH_W));
     const els = [];
 
-    // Title & hint
+    // Background
     els.push(
-      <text key="sch-title" x={MW/2} y={24} textAnchor="middle"
-        fill={th.a} fontSize={9} letterSpacing={4} opacity={0.55} fontFamily="monospace">
+      <rect key="sch-bg" x={0} y={0} width={SCH_W} height={SCH_H} fill="#000d06"/>
+    );
+
+    // Title & [S] hint
+    els.push(
+      <text key="sch-title" x={SCH_W/2} y={22} textAnchor="middle"
+        fill={th.a} fontSize={9} letterSpacing={4} opacity={0.45} fontFamily="monospace">
         SCHEMATIC VIEW — GGN → ALG
       </text>,
-      <text key="sch-hint" x={MW-10} y={24} textAnchor="end"
-        fill={th.a} fontSize={7} opacity={0.25} fontFamily="monospace">
+      <text key="sch-hint" x={SCH_W-10} y={22} textAnchor="end"
+        fill={th.a} fontSize={7} opacity={0.22} fontFamily="monospace">
         [S] GEO
       </text>
     );
 
-    // Segment coloured lines + annotations
+    // ── Segment coloured lines + distance labels (row 1 below rail) ──
     for (let i = 0; i < STOPS.length - 1; i++) {
       const color = segmentColor(i, displayTrams);
       const mx = (stopXs[i] + stopXs[i+1]) / 2;
       els.push(
         <line key={"sl"+i} x1={stopXs[i]} y1={SCH_Y} x2={stopXs[i+1]} y2={SCH_Y}
-          stroke={color} strokeWidth={3} opacity={0.75}/>,
-        <text key={"sd"+i} x={mx} y={SCH_Y+14} textAnchor="middle"
-          fill={th.a} fontSize={5.5} opacity={0.30} fontFamily="monospace">
+          stroke={color} strokeWidth={3.5} opacity={0.80}/>,
+        // Distance label — row 1 below
+        <text key={"sd"+i} x={mx} y={SCH_Y+18} textAnchor="middle"
+          fill={th.a} fontSize={7} opacity={0.20} fontFamily="monospace">
           {SCHEMATIC_DISTS[i]+"m"}
-        </text>,
-        <text key={"sr"+i} x={mx} y={SCH_Y+22} textAnchor="middle"
-          fill={th.a} fontSize={5} opacity={0.20} fontFamily="monospace">
-          {SB_RUNTIMES[i]+"↓ "+NB_RUNTIMES[i]+"↑s"}
         </text>
       );
+      // Runtime annotation — only shown for the selected tram's current segment
     }
 
-    // Stop nodes, codes, ETA labels
+    // ── Stop nodes + code labels above ──
     for (let i = 0; i < STOPS.length; i++) {
       const s = STOPS[i];
       const x = stopXs[i];
       const isSel = sel.t === "stop" && sel.d?.id === s.id;
       const onClick = () => setSel({t:"stop",d:s});
+
+      // Node marker (interchange = square, regular = circle)
       els.push(
         s.ix
-          ? <rect key={"sn"+i} x={x-6} y={SCH_Y-6} width={12} height={12}
-              fill={isSel?th.a+"44":"#00000099"} stroke={th.a}
-              strokeWidth={isSel?2:1.5} rx={1}
+          ? <rect key={"sn"+i} x={x-7} y={SCH_Y-7} width={14} height={14}
+              fill={isSel?th.a+"55":"#00000099"} stroke={th.a}
+              strokeWidth={isSel?2.5:1.5} rx={1}
               onClick={onClick} style={{cursor:"pointer"}}/>
-          : <circle key={"sn"+i} cx={x} cy={SCH_Y} r={isSel?5:4}
-              fill={isSel?th.a:"#000"} stroke={th.a} strokeWidth={1.2} opacity={0.7}
-              onClick={onClick} style={{cursor:"pointer"}}/>,
-        <text key={"sc"+i} x={x} y={SCH_Y-13} textAnchor="middle"
-          fill={th.a} fontSize={s.ix?7:6} fontWeight={s.ix?"bold":"normal"}
-          opacity={s.ix?0.9:0.6} fontFamily="monospace"
+          : <circle key={"sn"+i} cx={x} cy={SCH_Y} r={isSel?6:4.5}
+              fill={isSel?th.a:"#000"} stroke={th.a} strokeWidth={1.5} opacity={0.75}
+              onClick={onClick} style={{cursor:"pointer"}}/>
+      );
+
+      // Stop code — ABOVE the rail, 9px, consistent opacity
+      els.push(
+        <text key={"sc"+i} x={x} y={SCH_Y-16} textAnchor="middle"
+          fill={th.a} fontSize={9} fontWeight={s.ix?"bold":"normal"}
+          opacity={0.85} fontFamily="monospace"
           onClick={onClick} style={{cursor:"pointer"}}>
           {s.code}
         </text>
       );
-      const { sb: sbA, nb: nbA } = nextArrivalsAt(s.id, displayTrams);
-      if (sbA) els.push(
-        <text key={"eb"+i} x={x} y={SCH_Y+34} textAnchor="middle"
-          fill={sbA.tram.c} fontSize={5.5} fontFamily="monospace">
-          {"↓"+fmtEta(sbA.etaSec)}
-        </text>
-      );
-      if (nbA) els.push(
-        <text key={"en"+i} x={x} y={SCH_Y+43} textAnchor="middle"
-          fill={nbA.tram.c} fontSize={5.5} fontFamily="monospace">
-          {"↑"+fmtEta(nbA.etaSec)}
-        </text>
+
+      // Selection ring
+      if (isSel) {
+        els.push(
+          <circle key={"sring"+i} cx={x} cy={SCH_Y} r={s.ix?14:11}
+            fill="none" stroke={th.a} strokeWidth={0.8} opacity={0.35}>
+            <animate attributeName="r" values={s.ix?"11;17;11":"8;14;8"}
+              dur="2s" repeatCount="indefinite"/>
+          </circle>
+        );
+      }
+
+      // ETA badge — only for the selected stop
+      if (isSel) {
+        const { sb: sbA, nb: nbA } = nextArrivalsAt(s.id, displayTrams);
+        const line1 = sbA ? `SB ~${fmtEta(sbA.etaSec)}` : "SB  —";
+        const line2 = nbA ? `NB ~${fmtEta(nbA.etaSec)}` : "NB  —";
+        const bw = 72, bh = 30, bx = x - bw/2, by = SCH_Y - 60;
+        els.push(
+          <g key={"etabadge"+i}>
+            <rect x={bx} y={by} width={bw} height={bh}
+              fill="#000000e0" stroke={th.a} strokeWidth={0.8} rx={2}/>
+            <text x={x} y={by+10} textAnchor="middle"
+              fill={sbA ? sbA.tram.c : th.a} fontSize={7.5} fontFamily="monospace" opacity={0.9}>
+              {line1}
+            </text>
+            <text x={x} y={by+22} textAnchor="middle"
+              fill={nbA ? nbA.tram.c : th.a} fontSize={7.5} fontFamily="monospace" opacity={0.9}>
+              {line2}
+            </text>
+            {/* Stem from badge to stop code */}
+            <line x1={x} y1={by+bh} x2={x} y2={SCH_Y-28}
+              stroke={th.a} strokeWidth={0.5} opacity={0.25} strokeDasharray="2,2"/>
+          </g>
+        );
+      }
+    }
+
+    // ── Tram triangles — SB above line, NB below ──
+    for (const t of displayTrams) {
+      if (t.seg == null) continue;
+      const x  = schematicTramX(t.seg, t.routeT, SCH_PAD, SCH_W);
+      const isSel = sel.t === "tram" && sel.d?.id === t.id;
+      const triS  = isSel ? 10 : 7;
+      const ty2   = t.dir === "SB" ? SCH_Y - 26 : SCH_Y + 26;
+      els.push(
+        <g key={"stm"+t.id} onClick={() => setSel({t:"tram",d:t})} style={{cursor:"pointer"}}>
+          {/* Connector to rail */}
+          <line x1={x} y1={t.dir==="SB" ? ty2+triS+2 : ty2-triS-2}
+            x2={x} y2={t.dir==="SB" ? SCH_Y-7 : SCH_Y+7}
+            stroke={t.c} strokeWidth={0.6} opacity={0.35} strokeDasharray="2,1"/>
+          {/* Triangle */}
+          <polygon points={triPoints(x, ty2, t.dir, triS)}
+            fill={t.c} stroke={isSel?"#fff":t.c} strokeWidth={isSel?1.5:0.6}
+            style={{filter:`drop-shadow(0 0 4px ${t.c})`}}/>
+          {/* Tram ID label */}
+          <text x={x} y={t.dir==="SB" ? ty2-triS-5 : ty2+triS+11}
+            textAnchor="middle" fill={t.c} fontSize={7} fontWeight="bold" fontFamily="monospace">
+            {t.id}
+          </text>
+          {/* Speed label when selected */}
+          {isSel && <text x={x} y={t.dir==="SB" ? ty2-triS-15 : ty2+triS+22}
+            textAnchor="middle" fill={t.c} fontSize={6} opacity={0.65} fontFamily="monospace">
+            {Math.round(t.speed)+"km/h"}
+          </text>}
+        </g>
       );
     }
 
-    // Tram triangles — SB above line, NB below
-    for (const t of displayTrams) {
-      if (t.seg == null) continue;
-      const x = schematicTramX(t.seg, t.routeT);
-      const isSel = sel.t === "tram" && sel.d?.id === t.id;
-      const triS = isSel ? 8 : 6;
-      const ty2 = t.dir === "SB" ? SCH_Y - 20 : SCH_Y + 20;
+    // Runtime annotation for selected tram's current segment
+    const selTram = sel.t === "tram" ? displayTrams.find(tr => tr.id === sel.d?.id) : null;
+    if (selTram && selTram.seg != null) {
+      const rtX = (schematicX(selTram.seg, SCH_PAD, SCH_W) + schematicX(selTram.seg+1, SCH_PAD, SCH_W)) / 2;
       els.push(
-        <g key={"stm"+t.id} onClick={() => setSel({t:"tram",d:t})} style={{cursor:"pointer"}}>
-          <line x1={x} y1={t.dir==="SB" ? ty2+triS+1 : ty2-triS-1}
-            x2={x} y2={t.dir==="SB" ? SCH_Y-6 : SCH_Y+6}
-            stroke={t.c} strokeWidth={0.5} opacity={0.3} strokeDasharray="2,1"/>
-          <polygon points={triPoints(x, ty2, t.dir, triS)}
-            fill={t.c} stroke={isSel?"#fff":t.c} strokeWidth={isSel?1.5:0.6}
-            style={{filter:`drop-shadow(0 0 3px ${t.c})`}}/>
-          <text x={x} y={t.dir==="SB" ? ty2-triS-4 : ty2+triS+10}
-            textAnchor="middle" fill={t.c} fontSize={6} fontWeight="bold" fontFamily="monospace">
-            {t.id}
-          </text>
-        </g>
+        <text key="rt-ann" x={rtX} y={SCH_Y+32} textAnchor="middle"
+          fill={selTram.c} fontSize={7} fontFamily="monospace" opacity={0.75}>
+          {`${SB_RUNTIMES[selTram.seg]}↓ ${NB_RUNTIMES[selTram.seg]}↑s`}
+        </text>
       );
     }
 
     // Legend
     els.push(
-      <text key="sch-leg" x={10} y={MH-14} fill={th.a} fontSize={5.5}
+      <text key="sch-leg" x={SCH_PAD} y={SCH_H-10} fill={th.a} fontSize={6}
         opacity={0.22} fontFamily="monospace">
         {"● GREEN=NOMINAL  ● AMBER=BUNCHING <3min  ● RED=GAP >12min"}
       </text>
@@ -1004,6 +1058,17 @@ export default function CMETv4() {
         <div style={{flex:1,position:"relative",display:"flex",justifyContent:"center",
           alignItems:"center",overflow:"hidden",background:th.terr}}>
 
+        {schematicMode ? (
+          /* ═══ SCHEMATIC FULL TAKEOVER ═══
+             Replaces ALL geographic content — terrain, compass, HUD, zoom controls.
+             Left + right panels remain visible and functional.             */
+          <svg width="100%" height="100%" viewBox="0 0 1000 400"
+            preserveAspectRatio="xMidYMid meet"
+            style={{position:"absolute",inset:0,background:"#000d06"}}>
+            {renderSchematic()}
+          </svg>
+        ) : (<>
+
           {/* Terrain texture + grid + roads — hidden when sat imagery is active */}
           <svg width="100%" height="100%"
             style={{position:"absolute",inset:0,opacity:ly.sat?0:1,transition:"opacity 0.3s"}}>
@@ -1078,8 +1143,6 @@ export default function CMETv4() {
           >
 
             {/* SCHEMATIC MODE — replaces all geographic layers */}
-            {schematicMode ? renderSchematic() : (<>
-
             {/* Satellite imagery tiles — rendered first so all layers sit above */}
             {ly.sat && satTiles && (
               <g>
@@ -1330,8 +1393,6 @@ export default function CMETv4() {
               );
             })}
 
-            {/* End of geographic layers — schematic conditional */}
-            </>)}
           </svg>
 
           {/* HUD overlays */}
@@ -1375,8 +1436,8 @@ export default function CMETv4() {
 
           {/* ── SPEED PROFILE PANEL ── */}
           {ly.speedProfile && (() => {
-            const PW = 460, PH = 120;
-            const LPAD = 28, RPAD = 6, TPAD = 14, BPAD = 18;
+            const PW = 460, PH = 140;
+            const LPAD = 28, RPAD = 6, TPAD = 16, BPAD = 20;
             const CW = PW - LPAD - RPAD, CH = PH - TPAD - BPAD;
             const MAX_DIST = SCHEMATIC_CUM[SCHEMATIC_CUM.length - 1];
             const MAX_SPD  = 80;
@@ -1394,20 +1455,20 @@ export default function CMETv4() {
 
             return (
               <div style={{position:"absolute",bottom:46,left:0,right:0,height:PH,
-                background:"rgba(0,5,2,0.93)",borderTop:"1px solid "+th.a+"22",
-                zIndex:11,overflow:"hidden"}}>
+                background:"rgba(0,5,2,0.94)",backdropFilter:"blur(4px)",
+                borderTop:"1px solid "+th.a+"22",zIndex:11,overflow:"hidden"}}>
                 <svg width="100%" height="100%" viewBox={`0 0 ${PW} ${PH}`} preserveAspectRatio="none">
                   {/* Title */}
-                  <text x={LPAD} y={10} fill={th.a} fontSize={6} letterSpacing={2}
+                  <text x={LPAD} y={11} fill={th.a} fontSize={6} letterSpacing={2}
                     opacity={0.35} fontFamily="monospace">SPEED PROFILE km/h</text>
 
                   {/* Grid lines + Y-axis labels */}
-                  {[0,20,40,60,80].map(spd => (
+                  {[0,25,50,70].map(spd => (
                     <g key={"yg"+spd}>
                       <line x1={LPAD} y1={yOf(spd)} x2={LPAD+CW} y2={yOf(spd)}
-                        stroke={th.a} strokeWidth={0.3} opacity={0.08}/>
+                        stroke={th.a} strokeWidth={0.3} opacity={0.1}/>
                       <text x={LPAD-3} y={yOf(spd)+3} textAnchor="end"
-                        fill={th.a} fontSize={5} opacity={0.25} fontFamily="monospace">{spd}</text>
+                        fill={th.a} fontSize={5.5} opacity={0.30} fontFamily="monospace">{spd}</text>
                     </g>
                   ))}
 
@@ -1415,20 +1476,20 @@ export default function CMETv4() {
                   {STOPS.map((s, i) => (
                     <g key={"xtk"+i}>
                       <line x1={xOf(SCHEMATIC_CUM[i])} y1={TPAD+CH}
-                        x2={xOf(SCHEMATIC_CUM[i])} y2={TPAD+CH+3}
-                        stroke={th.a} strokeWidth={s.ix?1:0.5} opacity={s.ix?0.4:0.18}/>
-                      {s.ix && <text x={xOf(SCHEMATIC_CUM[i])} y={TPAD+CH+9}
+                        x2={xOf(SCHEMATIC_CUM[i])} y2={TPAD+CH+4}
+                        stroke={th.a} strokeWidth={s.ix?1:0.5} opacity={s.ix?0.45:0.18}/>
+                      {s.ix && <text x={xOf(SCHEMATIC_CUM[i])} y={TPAD+CH+10}
                         textAnchor="middle" fill={th.a} fontSize={4.5} opacity={0.3}
                         fontFamily="monospace">{s.code}</text>}
                     </g>
                   ))}
 
-                  {/* Speed limit step-function */}
+                  {/* Speed limit step-function — bright white dashed */}
                   <polyline points={spdPts.join(" ")}
-                    fill="none" stroke="#666" strokeWidth={1}
-                    strokeDasharray="4,3" opacity={0.65}/>
+                    fill="none" stroke="#ffffff" strokeWidth={2}
+                    strokeDasharray="6,4" opacity={0.38}/>
 
-                  {/* Tram dots */}
+                  {/* Tram dots — 6px with glow */}
                   {displayTrams.filter(t => t.seg != null).map(t => {
                     const dist  = tramDistFromGGN(t.seg, t.routeT);
                     const spd   = parseFloat(t.speed);
@@ -1436,10 +1497,10 @@ export default function CMETv4() {
                     const dotC  = spd <= limit ? "#00ff88" : spd <= limit+5 ? "#ffaa00" : "#ff3333";
                     return (
                       <g key={"sp"+t.id}>
-                        <circle cx={xOf(dist)} cy={yOf(spd)} r={4} fill={dotC}
-                          style={{filter:`drop-shadow(0 0 3px ${dotC})`}}/>
-                        <text x={xOf(dist)+5} y={yOf(spd)+3} fill={dotC}
-                          fontSize={5} fontFamily="monospace">{t.id}</text>
+                        <circle cx={xOf(dist)} cy={yOf(spd)} r={6} fill={dotC}
+                          style={{filter:`drop-shadow(0 0 4px ${dotC})`}}/>
+                        <text x={xOf(dist)+7} y={yOf(spd)+3} fill={dotC}
+                          fontSize={5.5} fontFamily="monospace">{t.id}</text>
                       </g>
                     );
                   })}
@@ -1447,6 +1508,9 @@ export default function CMETv4() {
               </div>
             );
           })()}
+
+        {/* End geographic mode */}
+        </>)}
         </div>
 
         {/* ── RIGHT PANEL ── */}
@@ -1524,7 +1588,7 @@ export default function CMETv4() {
                     {/* Platform / stop map photo */}
                     {STOP_IMAGES[D.id] && (
                       <div style={{marginBottom:8,borderRadius:2,overflow:"hidden",
-                        border:"1px solid "+th.a+"30",boxShadow:"0 0 8px "+th.a+"10"}}>
+                        border:"1px solid "+th.a+"40",boxShadow:"0 0 8px "+th.a+"18"}}>
                         <img src={STOP_IMAGES[D.id]} alt={D.name}
                           style={{width:"100%",display:"block",objectFit:"cover",maxHeight:120}}/>
                         <div style={{background:"#000a",padding:"2px 5px",fontSize:6,
