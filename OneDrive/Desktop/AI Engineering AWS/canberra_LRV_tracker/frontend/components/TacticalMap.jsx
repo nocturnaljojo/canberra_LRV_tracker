@@ -440,6 +440,8 @@ export default function CMETv4() {
     speedProfile:false, sat:false,
   });
   const [schematicMode, setSchematicMode] = useState(false);
+  const [rotated,       setRotated]       = useState(true);
+  const rotatedRef = useRef(true);
   const [vm,      setVm]      = useState("SAT");
   const [logs,    setLogs]    = useState([]);
   const [tab,     setTab]     = useState("intel");
@@ -496,8 +498,12 @@ export default function CMETv4() {
     setView(prev => {
       const rect = mapSvgRef.current?.getBoundingClientRect();
       if (!rect) return prev;
-      const dx = (e.clientX - dragRef.current.sx) / rect.width  * (MW / prev.z);
-      const dy = (e.clientY - dragRef.current.sy) / rect.height * (MH / prev.z);
+      const rawDx = (e.clientX - dragRef.current.sx) / rect.width  * (MW / prev.z);
+      const rawDy = (e.clientY - dragRef.current.sy) / rect.height * (MH / prev.z);
+      // Apply inverse rotation to delta so pan tracks map axes, not screen axes
+      const angle = rotatedRef.current ? -30 * Math.PI / 180 : 0;
+      const dx = rawDx * Math.cos(angle) - rawDy * Math.sin(angle);
+      const dy = rawDx * Math.sin(angle) + rawDy * Math.cos(angle);
       dragRef.current = { sx: e.clientX, sy: e.clientY };
       return {
         ...prev,
@@ -516,6 +522,7 @@ export default function CMETv4() {
 
   // Keep ref current so the animation interval can read tramState without stale closure
   useEffect(() => { tramStateRef.current = tramState; }, [tramState]);
+  useEffect(() => { rotatedRef.current = rotated; }, [rotated]);
 
   // Attach wheel listener as non-passive so preventDefault() works (stops page scroll)
   useEffect(() => {
@@ -723,6 +730,9 @@ export default function CMETv4() {
       if (e.key === "s" || e.key === "S") {
         setSchematicMode(prev => !prev);
         setView({ x:0, y:0, z:1 });
+      }
+      if (e.key === "d" || e.key === "D") {
+        setRotated(prev => !prev);
       }
     };
     window.addEventListener("keydown", handler);
@@ -1058,6 +1068,14 @@ export default function CMETv4() {
                 letterSpacing:1}}>
               SCHEMATIC [S]
             </div>
+            <div onClick={()=>setRotated(p=>!p)}
+              style={{padding:"3px 5px",cursor:"pointer",marginTop:1,
+                background:rotated?th.a+"15":"transparent",
+                fontWeight:rotated?"bold":"normal",
+                borderLeft:rotated?"2px solid "+th.a:"2px solid transparent",
+                letterSpacing:1}}>
+              DIAGONAL [D]
+            </div>
           </div>
 
           {/* FLEET | STOPS tab bar */}
@@ -1158,6 +1176,15 @@ export default function CMETv4() {
           </svg>
         ) : (<>
 
+          {/* ═══ ROTATION WRAPPER — terrain + scope (rings/compass) + data layers ═══
+              HUD overlays, vignette, zoom controls, speed profile stay OUTSIDE.      */}
+          <div style={{
+            position:"absolute", inset:0,
+            transform: rotated ? "rotate(30deg) scale(1.2)" : "none",
+            transformOrigin: "center center",
+            transition: "transform 0.4s ease",
+          }}>
+
           {/* Terrain texture + grid + roads — hidden when sat imagery is active */}
           <svg width="100%" height="100%"
             style={{position:"absolute",inset:0,opacity:ly.sat?0:1,transition:"opacity 0.3s"}}>
@@ -1181,17 +1208,9 @@ export default function CMETv4() {
             })}
           </svg>
 
-          {/* Scope / radar overlay */}
+          {/* Scope / radar overlay — vignette removed (it lives in the CSS div outside) */}
           <svg width={MW} height={MH} viewBox={"0 0 "+MW+" "+MH}
             style={{position:"absolute",inset:0,pointerEvents:"none",zIndex:8}}>
-            <defs>
-              <radialGradient id="vig" cx="50%" cy="50%" r="50%">
-                <stop offset="65%" stopColor="transparent"/>
-                <stop offset="85%" stopColor="rgba(0,0,0,0.25)"/>
-                <stop offset="100%" stopColor="rgba(0,0,0,0.65)"/>
-              </radialGradient>
-            </defs>
-            <rect width={MW} height={MH} fill="url(#vig)"/>
             {[70,140,210,290].map((r,i) => (
               <g key={"rr"+i}>
                 <circle cx={cx} cy={cy} r={r} fill="none" stroke={th.a}
@@ -1530,6 +1549,15 @@ export default function CMETv4() {
             )}
 
           </svg>
+
+          </div>
+          {/* ═══ END ROTATION WRAPPER ═══ */}
+
+          {/* CSS vignette — screen-aligned, replaces the SVG radialGradient rect */}
+          <div style={{
+            position:"absolute", inset:0, pointerEvents:"none", zIndex:9,
+            background:"radial-gradient(ellipse at center, transparent 65%, rgba(0,0,0,0.25) 85%, rgba(0,0,0,0.65) 100%)"
+          }}/>
 
           {/* HUD overlays */}
           <div style={{position:"absolute",top:8,left:"50%",transform:"translateX(-50%)",
