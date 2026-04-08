@@ -8,7 +8,7 @@ OPENWEATHER_KEY = os.getenv("OPENWEATHER_KEY", "")
 
 CMET_GTFSR_URL = os.getenv(
     "CMET_GTFSR_URL",
-    "http://files.transport.act.gov.au/feeds/lightrail.pb",
+    "https://files.transport.act.gov.au/feeds/lightrail.pb",
 )
 ACT_SODA_BASE = os.getenv(
     "ACT_SODA_BASE",
